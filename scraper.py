@@ -3,6 +3,7 @@ import datetime
 import csv
 import os
 import argparse
+from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
@@ -13,6 +14,9 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import matplotlib.pyplot as plt
 import traceback
+from thefuzz import fuzz
+
+load_dotenv()
 
 DONATIONS_CSV = 'donations.csv'
 CAMPAIGNS_CSV = 'campaigns.csv'
@@ -124,7 +128,13 @@ def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
     options.add_argument('--disable-gpu')
     options.add_argument('--window-size=1920x1080')
     
-    chromedriver_path = '/Users/alberthwang/Library/Projects/gsg-scraper/driver/chromedriver'
+    # Load ChromeDriver path from environment variable
+    chromedriver_path = os.getenv('CHROMEDRIVER_PATH')
+    if not chromedriver_path:
+        print("Error: CHROMEDRIVER_PATH environment variable not set.")
+        print("Please create a .env file in the project root and add: CHROMEDRIVER_PATH=/path/to/your/chromedriver")
+        return # Exit the function if path is not found
+
     service = ChromeService(executable_path=chromedriver_path)
     driver = None # Initialize driver to None
 
@@ -293,79 +303,191 @@ def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
             driver.quit()
         print(f"[{datetime.datetime.now().isoformat()}] Finished scrape for: {url}")
 
-def visualize_top_donors():
-    """Reads donations.csv and visualizes top 10 non-anonymous donors."""
+def get_aggregated_donor_data(top_n=10):
+    """
+    Reads donations.csv, processes data, groups similar donor names,
+    and returns aggregated top donor data and alias map.
+    """
     if not os.path.exists(DONATIONS_CSV):
         print(f"Error: {DONATIONS_CSV} not found. Scrape some data first.")
-        return
+        return None, None
 
     try:
         df = pd.read_csv(DONATIONS_CSV)
     except pd.errors.EmptyDataError:
         print(f"Error: {DONATIONS_CSV} is empty. Scrape some data first.")
-        return
+        return None, None
     except Exception as e:
         print(f"Error reading {DONATIONS_CSV}: {e}")
-        return
+        return None, None
 
     if df.empty:
         print(f"{DONATIONS_CSV} contains no data. Scrape some data first.")
-        return
+        return None, None
 
     df['amount_cleaned'] = df['amount'].astype(str).str.replace(r'[$,USD\s]', '', regex=True)
     df['amount_cleaned'] = pd.to_numeric(df['amount_cleaned'], errors='coerce')
     df.dropna(subset=['amount_cleaned'], inplace=True)
 
-    # Filter out various forms of anonymous donors (case-insensitive)
-    anonymous_patterns = ["anonymous", "anonymous giver"] 
+    anonymous_patterns = ["anonymous", "anonymous giver"]
     df_filtered = df[~df['donor_name'].astype(str).str.lower().isin(anonymous_patterns)]
-    # Additional exact case-sensitive filtering just in case
     df_filtered = df_filtered[~df_filtered['donor_name'].isin(["Anonymous Giver", "Anonymous"])]
 
-
     if df_filtered.empty:
-        print("No non-anonymous donations with valid amounts found to visualize.")
+        print("No non-anonymous donations with valid amounts found.")
+        return None, None
+
+    df_filtered['normalized_donor_name'] = df_filtered['donor_name'].astype(str).str.lower().str.strip()
+    normalized_to_originals_map = {}
+    for _, row in df_filtered.iterrows():
+        norm_name = row['normalized_donor_name']
+        orig_name = str(row['donor_name']).strip()
+        if norm_name not in normalized_to_originals_map:
+            normalized_to_originals_map[norm_name] = set()
+        normalized_to_originals_map[norm_name].add(orig_name)
+
+    unique_normalized_names = list(df_filtered['normalized_donor_name'].unique())
+    normalized_name_groups = []
+    processed_indices = set()
+    similarity_threshold = 88
+
+    for i in range(len(unique_normalized_names)):
+        if i in processed_indices:
+            continue
+        current_normalized_name = unique_normalized_names[i]
+        current_normalized_group = [current_normalized_name]
+        processed_indices.add(i)
+        for j in range(i + 1, len(unique_normalized_names)):
+            if j in processed_indices:
+                continue
+            other_normalized_name = unique_normalized_names[j]
+            if fuzz.token_sort_ratio(current_normalized_name, other_normalized_name) > similarity_threshold:
+                current_normalized_group.append(other_normalized_name)
+                processed_indices.add(j)
+        normalized_name_groups.append(current_normalized_group)
+
+    variant_to_canonical_normalized_map = {}
+    canonical_normalized_to_all_original_aliases_map = {}
+    for norm_group in normalized_name_groups:
+        if not norm_group: continue
+        canonical_normalized_name = sorted(norm_group)[0]
+        all_original_aliases_for_this_group = set()
+        for norm_name_in_group in norm_group:
+            variant_to_canonical_normalized_map[norm_name_in_group] = canonical_normalized_name
+            if norm_name_in_group in normalized_to_originals_map:
+                all_original_aliases_for_this_group.update(normalized_to_originals_map[norm_name_in_group])
+            else:
+                all_original_aliases_for_this_group.add(norm_name_in_group)
+        canonical_normalized_to_all_original_aliases_map[canonical_normalized_name] = all_original_aliases_for_this_group
+    
+    df_filtered['canonical_group_id'] = df_filtered['normalized_donor_name'].map(variant_to_canonical_normalized_map)
+    df_filtered['canonical_group_id'].fillna(df_filtered['normalized_donor_name'], inplace=True)
+    
+    for group_id in df_filtered['canonical_group_id'].unique():
+        if group_id not in canonical_normalized_to_all_original_aliases_map:
+            if group_id in normalized_to_originals_map:
+                 canonical_normalized_to_all_original_aliases_map[group_id] = normalized_to_originals_map[group_id]
+            else:
+                 canonical_normalized_to_all_original_aliases_map[group_id] = {group_id}
+
+    top_donors_aggregated = df_filtered.groupby('canonical_group_id')['amount_cleaned'].sum().nlargest(top_n)
+    
+    if top_donors_aggregated.empty:
+        print("No data to aggregate for top donors after fuzzy grouping and filtering.")
+        return None, None
+        
+    return top_donors_aggregated, canonical_normalized_to_all_original_aliases_map
+
+
+def visualize_top_donors():
+    """Visualizes top 10 donors with aliases."""
+    top_donors_aggregated, alias_map = get_aggregated_donor_data(top_n=10)
+
+    if top_donors_aggregated is None or top_donors_aggregated.empty:
+        print("No data to plot for top donors.")
         return
 
-    top_donors = df_filtered.groupby('donor_name')['amount_cleaned'].sum().nlargest(10)
+    plot_labels = []
+    for canonical_id_from_index in top_donors_aggregated.index:
+        original_aliases = sorted(list(alias_map.get(canonical_id_from_index, {str(canonical_id_from_index)})))
+        if not original_aliases:
+            plot_labels.append(str(canonical_id_from_index))
+            continue
+        primary_alias = original_aliases[0]
+        other_aliases = original_aliases[1:]
+        label = primary_alias
+        if other_aliases:
+            label += f" ({', '.join(other_aliases)})"
+        plot_labels.append(label)
 
-    if top_donors.empty:
-        print("No data to plot for top donors after filtering.")
-        return
-
-    plt.figure(figsize=(12, 8))
-    top_donors.sort_values(ascending=False).plot(kind='bar')
-    plt.title('Top 10 Donors (Total Amount Donated)')
-    plt.xlabel('Donor Name')
+    plt.figure(figsize=(14, 9))
+    bars = top_donors_aggregated.plot(kind='bar')
+    if plot_labels:
+        bars.set_xticklabels(plot_labels)
+    plt.title('Top 10 Donors (Total Amount Donated - Grouped by Similar Names)')
+    plt.xlabel('Donor Name (Aliases)')
     plt.ylabel('Total Amount Donated (USD)')
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
     print("Displaying top donors plot...")
     plt.show()
 
+def list_top_donors(top_n_to_list):
+    """Lists the top N donors to the console with aliases and amounts."""
+    if top_n_to_list <= 0:
+        print("Number of donors to list must be a positive integer.")
+        return
+
+    top_donors_aggregated, alias_map = get_aggregated_donor_data(top_n=top_n_to_list)
+
+    if top_donors_aggregated is None or top_donors_aggregated.empty:
+        print(f"No data to list for top {top_n_to_list} donors.")
+        return
+
+    print(f"\n--- Top {len(top_donors_aggregated)} Donors (Grouped by Similar Names) ---")
+    rank = 1
+    for canonical_id, total_amount in top_donors_aggregated.items():
+        original_aliases = sorted(list(alias_map.get(canonical_id, {str(canonical_id)})))
+        primary_alias = original_aliases[0] if original_aliases else str(canonical_id)
+        other_aliases_str = ""
+        if len(original_aliases) > 1:
+            other_aliases_str = f" (aka: {', '.join(original_aliases[1:])})"
+        
+        print(f"{rank}. {primary_alias}{other_aliases_str}: ${total_amount:,.2f}")
+        rank += 1
+    print("--- End of List ---")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Scrape GiveSendGo campaign data and optionally visualize donors.")
+    parser = argparse.ArgumentParser(description="Scrape GiveSendGo campaign data and optionally visualize or list donors.")
     
-    # Group for scraping input, not required if -visualize is used
-    scrape_input_group = parser.add_argument_group('Scraping Input (required if not visualizing)')
+    scrape_input_group = parser.add_argument_group('Scraping Input (conditionally required)')
     input_method_group = scrape_input_group.add_mutually_exclusive_group()
     input_method_group.add_argument("-url", metavar='URL', help="A single GiveSendGo campaign URL to scrape.")
     input_method_group.add_argument("-file", metavar='FILEPATH', help="Path to a .txt file containing line-separated GiveSendGo URLs.")
     
     parser.add_argument("-rescrape", action="store_true", help="Rescrape URLs even if they appear in campaigns.csv. Default is to skip.")
-    parser.add_argument("-visualize", action="store_true", help="Visualize top 10 donors from donations.csv and exit. This option ignores URL/file inputs for scraping.")
+    
+    # Analysis options (mutually exclusive with each other for simplicity, and run independently of scraping)
+    analysis_group = parser.add_argument_group('Analysis Options (run independently of scraping)')
+    analysis_action_group = analysis_group.add_mutually_exclusive_group()
+    analysis_action_group.add_argument("-visualize", action="store_true", help="Visualize top 10 donors from donations.csv and exit.")
+    analysis_action_group.add_argument("-list", "--list_donors", metavar='N', type=int, help="List the top N donors from donations.csv to the console and exit.")
 
     args = parser.parse_args()
 
-    init_csv_files() # Ensure CSV files and headers exist
+    init_csv_files() 
 
     if args.visualize:
         visualize_top_donors()
-        return # Exit after visualization
+        return
+    
+    if args.list_donors is not None:
+        list_top_donors(args.list_donors)
+        return
 
-    # If not visualizing, URL or file for scraping is required
     if not args.url and not args.file:
-        print("Error: You must provide either -url or -file for scraping if -visualize is not used.")
+        print("Error: You must provide either -url or -file for scraping if not using -visualize or -list.")
         parser.print_help()
         return
 
@@ -389,7 +511,7 @@ def main():
     scraped_campaigns_set = set()
     if not args.rescrape:
         scraped_campaigns_set = get_scraped_campaigns()
-        if scraped_campaigns_set: # Only print if set is not empty
+        if scraped_campaigns_set:
              print(f"Found {len(scraped_campaigns_set)} previously scraped campaigns to potentially skip.")
 
     valid_urls_for_current_session = []
@@ -409,7 +531,7 @@ def main():
     
     print(f"Preparing to scrape {len(valid_urls_for_current_session)} URL(s).")
     for url_item in valid_urls_for_current_session:
-        scrape_campaign(url_item, args.rescrape) # Pass rescrape status
+        scrape_campaign(url_item, args.rescrape)
 
 if __name__ == "__main__":
     main()

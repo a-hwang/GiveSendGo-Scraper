@@ -2,3 +2,6 @@ selenium
 beautifulsoup4
 pandas
 matplotlib
+thefuzz
+python-Levenshtein
+python-dotenv
