@@ -82,5 +82,5 @@ python scraper.py -h
 
 ## Notes
 
--   Be respectful of the website's terms of service and avoid overly aggressive scraping. The script includes `time.sleep()` calls to be polite.
+-   Avoid overly aggressive scraping. The script includes `time.sleep()` calls to be polite.
 -   Web page structures can change, which might break the selectors used in the script. If the script fails to find elements, the CSS selectors in `scraper.py` may need to be updated.

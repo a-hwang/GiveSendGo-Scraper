@@ -47,7 +47,7 @@ def get_scraped_campaigns():
         with open(CAMPAIGNS_CSV, 'r', newline='', encoding='utf-8') as f:
             # Skip header row before reading
             next(f, None) 
-            reader = csv.reader(f) # Use csv.reader to avoid issues if columns are missing in some rows
+            reader = csv.reader(f)
             for row in reader:
                 if row: # Ensure row is not empty
                     scraped.add(row[0]) # campaign_url is the first column
@@ -104,7 +104,7 @@ def save_or_update_campaign_summary(campaign_data_dict):
         except Exception as e:
             print(f"Error reading {CAMPAIGNS_CSV} for update: {e}. Will attempt to overwrite.")
             # If reading fails catastrophically, we might lose old data if we proceed to write.
-            # For now, we'll proceed, but this could be made more robust (e.g., backup before write).
+            # Use this for now, but this could be made more robust (e.g., backup before write).
 
     if not updated:
         rows.append(campaign_data_dict) # Add as new if not found or file didn't exist/was empty
