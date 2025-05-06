@@ -30,9 +30,8 @@ def init_csv_files():
     
     if not os.path.exists(CAMPAIGNS_CSV):
         with open(CAMPAIGNS_CSV, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
             # Define headers for campaigns.csv
-            fieldnames = ['campaign_url', 'total_donors_count', 'amount_raised', 'scraped_at']
+            fieldnames = ['campaign_url', 'total_donors_count', 'amount_raised', 'campaign_creator', 'funds_receiver', 'scraped_at']
             dict_writer = csv.DictWriter(f, fieldnames=fieldnames)
             dict_writer.writeheader()
 
@@ -89,7 +88,7 @@ def get_existing_donation_keys_for_url(url_to_check):
 
 def save_or_update_campaign_summary(campaign_data_dict):
     """Saves or updates a campaign's summary in campaigns.csv."""
-    fieldnames = ['campaign_url', 'total_donors_count', 'amount_raised', 'scraped_at']
+    fieldnames = ['campaign_url', 'total_donors_count', 'amount_raised', 'campaign_creator', 'funds_receiver', 'scraped_at']
     campaign_url_to_update = campaign_data_dict['campaign_url']
     
     rows = []
@@ -124,7 +123,7 @@ def save_or_update_campaign_summary(campaign_data_dict):
 def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
     """Scrapes donation data from a given GiveSendGo campaign URL."""
     options = webdriver.ChromeOptions()
-    # options.add_argument('--headless') # Uncomment for headless mode
+    options.add_argument('--headless') # Uncomment for headless mode
     options.add_argument('--disable-gpu')
     options.add_argument('--window-size=1920x1080')
     
@@ -143,6 +142,8 @@ def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
 
     total_donors_on_button = "N/A"
     amount_raised_text = "N/A"
+    campaign_creator = "N/A"
+    funds_receiver = "N/A"
 
     existing_donation_keys_this_url = set()
     if rescrape_mode:
@@ -156,18 +157,65 @@ def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
         driver.get(url)
         wait = WebDriverWait(driver, 20) # General wait time
 
-        # --- 1. Extract Total Donors (from button) & Amount Raised ---
+        # --- 1. Extract Total Donors (from button), Amount Raised, Creator, Fund Receiver ---
         try:
-            # Updated XPath to target the span within the visible desktop "Give" button
-            give_button_counter_locator = (By.XPATH, "//button[contains(@class, 'give-button') and contains(@class, 'lg:flex')]//span[contains(@class, 'button__counter--give')]")
-            give_counter_element = wait.until(EC.visibility_of_element_located(give_button_counter_locator))
+            # Primary attempt: Use the more anchored XPath based on the provided parent div structure
+            give_button_counter_locator_xpath = (By.XPATH, "//div[contains(@class, 'lg:flex') and contains(@class, 'space-y-4')]/button[contains(@class, 'give-button') and contains(@class, 'lg:flex')]//span[contains(@class, 'ml-auto') and contains(@class, 'button__counter--give')]")
+            give_counter_element = wait.until(EC.visibility_of_element_located(give_button_counter_locator_xpath))
             total_donors_on_button = give_counter_element.text.strip()
-            print(f"[{datetime.datetime.now().isoformat()}] Total donors on button: {total_donors_on_button}")
+            print(f"[{datetime.datetime.now().isoformat()}] Total donors on button (using primary XPath): {total_donors_on_button}")
         except TimeoutException:
-            print("Could not find the total donors on button counter. The element might be missing, hidden, or the page structure may have changed.")
+            print("Could not find the total donors on button counter using primary XPath.")
+            # Fallback to CSS selector if XPath fails
+            try:
+                print("Attempting fallback CSS selector for total donors on button counter...")
+                give_button_counter_selector = "button.give-button.lg\:flex span.ml-auto.button__counter--give"
+                give_counter_element = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, give_button_counter_selector)))
+                total_donors_on_button = give_counter_element.text.strip()
+                print(f"[{datetime.datetime.now().isoformat()}] Total donors on button (using fallback CSS selector): {total_donors_on_button}")
+            except TimeoutException:
+                print("Fallback CSS selector for total donors on button counter also failed.")
+            except Exception as e_css:
+                print(f"An error occurred while extracting total donors on button using fallback CSS selector: {e_css}")
         except Exception as e:
             print(f"An error occurred while extracting total donors on button: {e}")
 
+        # Parse static page details with BeautifulSoup after main content is likely loaded
+        # It's good to do this after an initial wait/element interaction like the one above
+        time.sleep(2) # Give a brief moment for JS to settle if any post-load changes occur
+        page_soup = BeautifulSoup(driver.page_source, 'html.parser')
+
+        # Extract Campaign Creator
+        try:
+            creator_div_texts = page_soup.find_all("div", class_="mt-4")
+            for div_text_element in creator_div_texts:
+                if "Campaign created by" in div_text_element.get_text():
+                    creator_span = div_text_element.find("span", class_="font-semibold")
+                    if creator_span:
+                        campaign_creator = creator_span.text.strip()
+                        print(f"[{datetime.datetime.now().isoformat()}] Campaign created by: {campaign_creator}")
+                        break
+            if campaign_creator == "N/A":
+                print("Could not find 'Campaign created by' information.")
+        except Exception as e:
+            print(f"An error occurred while extracting campaign creator: {e}")
+
+        # Extract Funds Receiver
+        try:
+            receiver_p_texts = page_soup.find_all("p", class_="mt-4 text-base")
+            for p_text_element in receiver_p_texts:
+                if "Campaign funds will be received by" in p_text_element.get_text():
+                    receiver_span = p_text_element.find("span", class_="font-semibold")
+                    if receiver_span:
+                        funds_receiver = receiver_span.text.strip()
+                        print(f"[{datetime.datetime.now().isoformat()}] Funds will be received by: {funds_receiver}")
+                        break
+            if funds_receiver == "N/A":
+                 print("Could not find 'Campaign funds will be received by' information.")
+        except Exception as e:
+            print(f"An error occurred while extracting funds receiver: {e}")
+        
+        # Extract Amount Raised (existing logic)
         try:
             details_container_selectors = ["div.donation__details", "div.camp-details__wrapper", "div.max-w-md.space-y-10"]
             details_container = None
@@ -215,7 +263,7 @@ def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
         comment_selector = "p.mt-2"
 
         while True:
-            time.sleep(0.5) # Increased wait for content to load/settle
+            time.sleep(0.5)
 
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             recent_donations_container = soup.select_one("div.recent-donations__wrapper")
@@ -290,6 +338,8 @@ def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
             'campaign_url': url,
             'total_donors_count': total_donors_on_button,
             'amount_raised': amount_raised_text,
+            'campaign_creator': campaign_creator,
+            'funds_receiver': funds_receiver,
             'scraped_at': scraped_at_timestamp
         }
         save_or_update_campaign_summary(campaign_summary_data)
