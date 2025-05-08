@@ -31,7 +31,7 @@ def init_csv_files():
     if not os.path.exists(CAMPAIGNS_CSV):
         with open(CAMPAIGNS_CSV, 'w', newline='', encoding='utf-8') as f:
             # Define headers for campaigns.csv
-            fieldnames = ['campaign_url', 'total_donors_count', 'amount_raised', 'campaign_creator', 'funds_receiver', 'scraped_at']
+            fieldnames = ['campaign_url', 'total_donors_count', 'amount_raised', 'campaign_creator', 'funds_receiver', 'campaign_title', 'campaign_description', 'last_update_date', 'last_update_content', 'scraped_at']
             dict_writer = csv.DictWriter(f, fieldnames=fieldnames)
             dict_writer.writeheader()
 
@@ -88,7 +88,7 @@ def get_existing_donation_keys_for_url(url_to_check):
 
 def save_or_update_campaign_summary(campaign_data_dict):
     """Saves or updates a campaign's summary in campaigns.csv."""
-    fieldnames = ['campaign_url', 'total_donors_count', 'amount_raised', 'campaign_creator', 'funds_receiver', 'scraped_at']
+    fieldnames = ['campaign_url', 'total_donors_count', 'amount_raised', 'campaign_creator', 'funds_receiver', 'campaign_title', 'campaign_description', 'last_update_date', 'last_update_content', 'scraped_at']
     campaign_url_to_update = campaign_data_dict['campaign_url']
     
     rows = []
@@ -144,6 +144,10 @@ def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
     amount_raised_text = "N/A"
     campaign_creator = "N/A"
     funds_receiver = "N/A"
+    campaign_title = "N/A"
+    campaign_description = "N/A"
+    last_update_date = "N/A"
+    last_update_content = "N/A"
 
     existing_donation_keys_this_url = set()
     if rescrape_mode:
@@ -185,6 +189,64 @@ def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
         time.sleep(2) # Give a brief moment for JS to settle if any post-load changes occur
         page_soup = BeautifulSoup(driver.page_source, 'html.parser')
 
+        # Extract Campaign Title
+        try:
+            title_tag = page_soup.find("h1", attrs={"data-test": "campaign-title"})
+            if title_tag:
+                campaign_title = title_tag.text.strip()
+                print(f"[{datetime.datetime.now().isoformat()}] Campaign Title: {campaign_title}")
+            else:
+                # Fallback if data-test attribute is not found or changes
+                title_tag_fallback = page_soup.select_one("div.campaign__details--article h1.text-3xl.font-bold")
+                if title_tag_fallback:
+                    campaign_title = title_tag_fallback.text.strip()
+                    print(f"[{datetime.datetime.now().isoformat()}] Campaign Title (fallback): {campaign_title}")
+                else:
+                    print("Could not find campaign title.")
+        except Exception as e:
+            print(f"An error occurred while extracting campaign title: {e}")
+
+        # Extract Campaign Description
+        try:
+            # The description is in a div that's a sibling to h1, after a div with class="mt-3"
+            # Locate the main article container first
+            article_container = page_soup.select_one("div.campaign__details--article")
+            if article_container:
+                h1_tag = article_container.find("h1", attrs={"data-test": "campaign-title"})
+                if not h1_tag: # Fallback for h1
+                    h1_tag = article_container.select_one("h1.text-3xl.font-bold")
+
+                if h1_tag:
+                    # The description div is usually the one after h1 and its immediate sibling (div.mt-3)
+                    current_element = h1_tag
+                    div_mt3_found = False
+                    description_div = None
+                    
+                    # Iterate through next siblings to find the correct description div
+                    for sibling in current_element.find_next_siblings():
+                        if sibling.name == 'div' and 'mt-3' in sibling.get('class', []):
+                            div_mt3_found = True
+                            continue # Move to the next sibling after div.mt-3
+                        if div_mt3_found and sibling.name == 'div' and not sibling.get('class', []): # The description div often has no specific class
+                            # Check it's not the gradient cutoff
+                            if 'gradient-cutoff' not in sibling.get('class', []):
+                                description_div = sibling
+                                break
+                    
+                    if description_div:
+                        campaign_description = description_div.get_text(separator='\n', strip=True)
+                        # Limit description length if necessary, e.g., to 1000 characters
+                        # campaign_description = (campaign_description[:997] + '...') if len(campaign_description) > 1000 else campaign_description
+                        print(f"[{datetime.datetime.now().isoformat()}] Campaign Description extracted (length: {len(campaign_description)}).")
+                    else:
+                        print("Could not find campaign description div using sibling logic.")
+                else:
+                    print("Could not find H1 tag to locate description.")
+            else:
+                print("Could not find campaign article container for description.")
+        except Exception as e:
+            print(f"An error occurred while extracting campaign description: {e}")
+
         # Extract Campaign Creator
         try:
             creator_div_texts = page_soup.find_all("div", class_="mt-4")
@@ -215,6 +277,99 @@ def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
         except Exception as e:
             print(f"An error occurred while extracting funds receiver: {e}")
         
+        # Extract Last Update Date and Content
+        try:
+            # Find the container for all updates first
+            updates_section_container = page_soup.find("div", class_="bg-neutral-100") # More general selector for the updates box
+            if updates_section_container and updates_section_container.find("h4", string="Updates"):
+                # Find the first (latest) update item
+                latest_update_item = updates_section_container.find("div", class_="updates__item")
+                if latest_update_item:
+                    # Extract date
+                    date_tag = latest_update_item.find("p", class_="font-semibold")
+                    if date_tag:
+                        last_update_date = date_tag.text.strip()
+                        print(f"[{datetime.datetime.now().isoformat()}] Last Update Date: {last_update_date}")
+                    else:
+                        print("Could not find last update date tag.")
+
+                    # --- Extract update title and message for last_update_content ---
+                    update_title_str = ""
+                    update_message_str = ""
+
+                    # Preferred path: find the container div.flex-auto.update-content which holds title, date, and message div
+                    update_details_container = latest_update_item.select_one("div.flex-auto.update-content")
+                    if update_details_container:
+                        # Get title (h6) from this container
+                        title_h6 = update_details_container.select_one("h6")
+                        if title_h6:
+                            update_title_str = title_h6.text.strip()
+                        
+                        # Get message (div.mt-1.update-content) from this container
+                        message_div = update_details_container.select_one("div.mt-1.update-content")
+                        if message_div:
+                            paragraphs = message_div.find_all("p")
+                            if paragraphs:
+                                update_message_str = "\n".join(p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True))
+                            else: # Fallback if no <p> tags, just get all text from the message_div
+                                update_message_str = message_div.get_text(separator='\n', strip=True)
+                    else:
+                        # Fallback if div.flex-auto.update-content is not found
+                        print("Could not find 'div.flex-auto.update-content'. Using broader search for update title and message.")
+                        # Try to find h6 directly within latest_update_item
+                        title_h6_fallback = latest_update_item.select_one("h6")
+                        if title_h6_fallback:
+                            update_title_str = title_h6_fallback.text.strip()
+                        
+                        # Try to find the message content div (div.mt-1.update-content or broader div.update-content)
+                        # directly within latest_update_item
+                        message_div_fallback = latest_update_item.select_one("div.mt-1.update-content")
+                        if not message_div_fallback: 
+                            # If specific message div not found, try the original broader selector for content
+                            # This was the original selector for content_div in previous versions.
+                            message_div_fallback = latest_update_item.find("div", class_="update-content")
+
+                        if message_div_fallback:
+                            paragraphs = message_div_fallback.find_all("p")
+                            # Filter out the date paragraph if it was accidentally included by a broad selector
+                            # This is a heuristic; ideally, selectors are precise.
+                            filtered_paragraphs = [p for p in paragraphs if "font-semibold" not in p.get("class", [])]
+                            if not filtered_paragraphs and paragraphs: # If filtering removed everything, use original paragraphs
+                                filtered_paragraphs = paragraphs
+                            
+                            if filtered_paragraphs:
+                                update_message_str = "\n".join(p.get_text(strip=True) for p in filtered_paragraphs if p.get_text(strip=True))
+                            else: # Fallback if no <p> tags or after filtering, just get all text
+                                update_message_str = message_div_fallback.get_text(separator='\n', strip=True)
+                                # Heuristic to remove date if it's at the start of this broader text
+                                if last_update_date != "N/A" and update_message_str.startswith(last_update_date):
+                                    update_message_str = update_message_str[len(last_update_date):].strip()
+                    
+                    # Assemble last_update_content
+                    if update_title_str and update_message_str:
+                        last_update_content = f"{update_title_str}\n{update_message_str}"
+                    elif update_message_str: # Only message
+                        last_update_content = update_message_str
+                    elif update_title_str: # Only title
+                        last_update_content = update_title_str
+                    # If both are empty, last_update_content remains "N/A" (its initial value from func start)
+
+                    if last_update_content != "N/A":
+                        if update_title_str: # Print title part if found
+                             print(f"[{datetime.datetime.now().isoformat()}] Last Update Title part: '{update_title_str}'")
+                        if update_message_str: # Print message part if found
+                             print(f"[{datetime.datetime.now().isoformat()}] Last Update Message part (length: {len(update_message_str)}).")
+                        print(f"[{datetime.datetime.now().isoformat()}] Assembled Last Update Content (length: {len(last_update_content)}). Preview: {last_update_content[:150].replace('\n', ' ')}...")
+                    else:
+                        print("Could not assemble meaningful last update content (title and/or message not found).")
+                else:
+                    print("No update items found within the updates section.")
+            else:
+                print("Updates section not found on the page.")
+        except Exception as e:
+            print(f"An error occurred while extracting last update details: {e}")
+            traceback.print_exc()
+
         # Extract Amount Raised (existing logic)
         try:
             details_container_selectors = ["div.donation__details", "div.camp-details__wrapper", "div.max-w-md.space-y-10"]
@@ -340,6 +495,10 @@ def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
             'amount_raised': amount_raised_text,
             'campaign_creator': campaign_creator,
             'funds_receiver': funds_receiver,
+            'campaign_title': campaign_title,
+            'campaign_description': campaign_description,
+            'last_update_date': last_update_date,
+            'last_update_content': last_update_content,
             'scraped_at': scraped_at_timestamp
         }
         save_or_update_campaign_summary(campaign_summary_data)
