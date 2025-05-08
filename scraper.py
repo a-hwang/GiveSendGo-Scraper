@@ -31,7 +31,7 @@ def init_csv_files():
     if not os.path.exists(CAMPAIGNS_CSV):
         with open(CAMPAIGNS_CSV, 'w', newline='', encoding='utf-8') as f:
             # Define headers for campaigns.csv
-            fieldnames = ['campaign_url', 'total_donors_count', 'amount_raised', 'campaign_creator', 'funds_receiver', 'campaign_title', 'campaign_description', 'last_update_date', 'last_update_content', 'scraped_at']
+            fieldnames = ['campaign_url', 'total_donors_count', 'amount_raised', 'campaign_creator', 'funds_receiver', 'campaign_title', 'campaign_description', 'last_update_date', 'last_update_content', 'summed_donations', 'scraped_at']
             dict_writer = csv.DictWriter(f, fieldnames=fieldnames)
             dict_writer.writeheader()
 
@@ -88,7 +88,7 @@ def get_existing_donation_keys_for_url(url_to_check):
 
 def save_or_update_campaign_summary(campaign_data_dict):
     """Saves or updates a campaign's summary in campaigns.csv."""
-    fieldnames = ['campaign_url', 'total_donors_count', 'amount_raised', 'campaign_creator', 'funds_receiver', 'campaign_title', 'campaign_description', 'last_update_date', 'last_update_content', 'scraped_at']
+    fieldnames = ['campaign_url', 'total_donors_count', 'amount_raised', 'campaign_creator', 'funds_receiver', 'campaign_title', 'campaign_description', 'last_update_date', 'last_update_content', 'summed_donations', 'scraped_at']
     campaign_url_to_update = campaign_data_dict['campaign_url']
     
     rows = []
@@ -120,10 +120,48 @@ def save_or_update_campaign_summary(campaign_data_dict):
     except Exception as e:
         print(f"Error writing updated data to {CAMPAIGNS_CSV}: {e}")
 
+def calculate_summed_donations_for_url(campaign_url):
+    """
+    Reads donations.csv, filters by campaign_url, cleans donation amounts,
+    and returns the sum of these donations.
+    """
+    if not os.path.exists(DONATIONS_CSV):
+        print(f"Warning: {DONATIONS_CSV} not found. Cannot calculate summed donations for {campaign_url}.")
+        return 0.0
+
+    try:
+        df = pd.read_csv(DONATIONS_CSV)
+        if df.empty:
+            print(f"Warning: {DONATIONS_CSV} is empty. Cannot calculate summed donations for {campaign_url}.")
+            return 0.0
+        
+        # Filter for the specific campaign
+        campaign_donations_df = df[df['campaign_url'] == campaign_url].copy() # Use .copy() to avoid SettingWithCopyWarning
+        
+        if campaign_donations_df.empty:
+            # This can happen if the campaign had no donations scraped or if the URL is new
+            # print(f"No donations found in {DONATIONS_CSV} for {campaign_url}. Summed donations will be 0.")
+            return 0.0
+
+        # Clean the 'amount' column
+        campaign_donations_df['amount_cleaned'] = campaign_donations_df['amount'].astype(str).str.replace(r'[$,USD\s]', '', regex=True)
+        campaign_donations_df['amount_cleaned'] = pd.to_numeric(campaign_donations_df['amount_cleaned'], errors='coerce')
+        
+        # Sum the cleaned amounts, fill NaN with 0 before summing
+        total_summed = campaign_donations_df['amount_cleaned'].fillna(0).sum()
+        return round(total_summed, 2)
+        
+    except pd.errors.EmptyDataError:
+        print(f"Warning: {DONATIONS_CSV} is empty when trying to calculate sum for {campaign_url}.")
+        return 0.0
+    except Exception as e:
+        print(f"Error calculating summed donations for {campaign_url} from {DONATIONS_CSV}: {e}")
+        return 0.0
+
 def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
     """Scrapes donation data from a given GiveSendGo campaign URL."""
     options = webdriver.ChromeOptions()
-    options.add_argument('--headless') # Uncomment for headless mode
+    options.add_argument('--headless') # Comment to disable headless mode
     options.add_argument('--disable-gpu')
     options.add_argument('--window-size=1920x1080')
     
@@ -148,6 +186,7 @@ def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
     campaign_description = "N/A"
     last_update_date = "N/A"
     last_update_content = "N/A"
+    summed_donations = 0.0
 
     existing_donation_keys_this_url = set()
     if rescrape_mode:
@@ -487,6 +526,10 @@ def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
                 print(f"Error clicking 'Load More' button: {e}")
                 break
         
+        # --- Calculate Summed Donations from CSV ---
+        summed_donations = calculate_summed_donations_for_url(url)
+        print(f"[{datetime.datetime.now().isoformat()}] Calculated summed donations for {url}: ${summed_donations:,.2f}")
+
         # --- 3. Save Campaign Summary to CSV ---
         # Create a dictionary for the campaign data
         campaign_summary_data = {
@@ -499,6 +542,7 @@ def scrape_campaign(url, rescrape_mode=False):  # Added rescrape_mode parameter
             'campaign_description': campaign_description,
             'last_update_date': last_update_date,
             'last_update_content': last_update_content,
+            'summed_donations': summed_donations,
             'scraped_at': scraped_at_timestamp
         }
         save_or_update_campaign_summary(campaign_summary_data)
